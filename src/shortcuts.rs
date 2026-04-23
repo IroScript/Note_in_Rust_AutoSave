@@ -40,7 +40,7 @@ pub fn shortcut_data() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("Alt+Delete",  "Delete current file"),
                 ("Ctrl+R",      "Rename file"),
                 ("Ctrl+O",      "Open save folder"),
-                ("Alt+C",       "Close application"),
+                ("Alt+Q",       "Close application"),
             ],
         ),
         (
@@ -49,7 +49,7 @@ pub fn shortcut_data() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("Alt+F",         "Change font"),
                 ("Alt+S",         "Change font size"),
                 ("Ctrl+Scroll",   "Zoom in / out"),
-                ("Ctrl+Alt+C",    "Change background color"),
+                ("Ctrl+Shift+B",  "Change background color"),
             ],
         ),
     ]

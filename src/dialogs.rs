@@ -20,8 +20,8 @@ pub struct FindDialog {
     pub query:          String,
     pub match_case:     bool,
     pub result_msg:     String,
-    pub found_range:    Option<(usize, usize)>, // char-index range of last hit
     pub find_requested: bool,
+    pub focus_query_next_frame: bool,
 }
 
 impl Default for FindDialog {
@@ -31,8 +31,8 @@ impl Default for FindDialog {
             query:          String::new(),
             match_case:     false,
             result_msg:     String::new(),
-            found_range:    None,
             find_requested: false,
+            focus_query_next_frame: false,
         }
     }
 }
@@ -67,9 +67,11 @@ impl FindDialog {
                         [270.0, 22.0],
                         TextEdit::singleline(&mut self.query).font(egui::TextStyle::Body),
                     );
-                    if resp.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
+                    if self.focus_query_next_frame {
+                        resp.request_focus();
+                        self.focus_query_next_frame = false;
+                    }
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         self.find_requested = true;
                     }
                 });
@@ -418,6 +420,7 @@ pub struct RenameDialog {
     pub error_msg:    String,       // mirrors `status_var` (red)
     pub current_name: String,       // mirrors `current_name` label
     pub apply:        Option<String>,
+    pub focus_name_next_frame: bool,
 }
 
 impl Default for RenameDialog {
@@ -428,6 +431,7 @@ impl Default for RenameDialog {
             error_msg:    String::new(),
             current_name: String::new(),
             apply:        None,
+            focus_name_next_frame: false,
         }
     }
 }
@@ -469,11 +473,14 @@ impl RenameDialog {
                         [280.0, 22.0],
                         TextEdit::singleline(&mut self.new_name),
                     );
-                    // Enter key submits (mirrors `name_entry.bind("<Return>", ...)`)
-                    if resp.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
-                        self.apply = Some(self.new_name.clone());
+                    if self.focus_name_next_frame {
+                        resp.request_focus();
+                        self.focus_name_next_frame = false;
+                    }
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if !self.new_name.trim().is_empty() {
+                            self.apply = Some(self.new_name.clone());
+                        }
                     }
                 });
 

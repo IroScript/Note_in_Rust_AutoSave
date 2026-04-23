@@ -16,7 +16,7 @@ A fast, feature-rich notepad application built with Rust and egui.
 ## Requirements
 
 - Rust 1.70+ (install from https://rustup.rs/)
-- OpenGL 2.0+ compatible GPU
+- Windows 10/11 (WGPU backend; no OpenGL requirement)
 
 ## Building
 
@@ -48,7 +48,7 @@ Or run the executable directly:
 | Alt+Delete | Delete current file |
 | Ctrl+R | Rename file |
 | Ctrl+O | Open save folder |
-| Alt+C | Close application |
+| Alt+Q | Close application |
 | Ctrl+Up | Go to first line |
 | Ctrl+Down | Go to last line |
 | F1 | Show shortcuts help |

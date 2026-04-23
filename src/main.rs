@@ -15,7 +15,7 @@ mod settings;
 mod shortcuts;
 
 use app::IrakNotesApp;
-use eframe::NativeOptions;
+use eframe::{HardwareAcceleration, NativeOptions, Renderer};
 
 fn main() -> eframe::Result<()> {
     // ── window setup (mirrors root.geometry("900x600") + theme) ──────────
@@ -24,10 +24,11 @@ fn main() -> eframe::Result<()> {
             .with_title("Irak Notes")
             .with_inner_size([900.0, 600.0])
             .with_min_inner_size([400.0, 300.0]),
+        renderer: Renderer::Wgpu,
+        hardware_acceleration: HardwareAcceleration::Off,
         ..Default::default()
     };
 
-    // Try to run with glow (OpenGL), if it fails, show error message
     match eframe::run_native(
         "Irak Notes",
         native_options,
@@ -42,10 +43,6 @@ fn main() -> eframe::Result<()> {
         Ok(result) => Ok(result),
         Err(e) => {
             eprintln!("Error: {:?}", e);
-            eprintln!("\nYour system doesn't support OpenGL 2.0+.");
-            eprintln!("Please use the Python version instead:");
-            eprintln!("  python Irak_Note.py");
-            eprintln!("\nThe Python version has all the same features and works on any system.");
             Err(e)
         }
     }

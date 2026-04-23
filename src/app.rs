@@ -29,7 +29,7 @@
 // ============================================================
 
 use egui::{
-    Color32, Context, FontId, Key, Modifiers, RichText,
+    Color32, Context, FontId, Key, RichText,
     ScrollArea, TextEdit, Vec2,
 };
 use std::path::PathBuf;
@@ -59,6 +59,7 @@ pub struct IrakNotesApp {
     // ── cursor position (mirrors update_cursor_position) ─────────────────────
     cursor_line:        usize,
     cursor_col:         usize,
+    cursor_char_index:  usize,
 
     // ── status bar (mirrors status_message / title bar) ───────────────────────
     status_msg:         String,
@@ -83,6 +84,8 @@ pub struct IrakNotesApp {
     /// Pending selection to apply to the TextEdit next frame.
     /// Some((start_char, end_char)) after a successful find.
     pending_selection:  Option<(usize, usize)>,
+    /// Give keyboard focus to the main editor for N upcoming frames.
+    focus_editor_frames_remaining: u8,
 
     // ── scroll / line-number sync (Part 2) ───────────────────────────────────
     /// Live scroll-Y pixel offset read from the ScrollArea state last frame.
@@ -137,6 +140,7 @@ impl IrakNotesApp {
             fg_color,
             cursor_line:        1,
             cursor_col:         0,
+            cursor_char_index:  0,
             status_msg:         "Ready".to_string(),
             is_saved:           true,
             line_numbers:       LineNumbers::new(),
@@ -150,6 +154,7 @@ impl IrakNotesApp {
             show_delete_confirm: false,
             find_char_offset:   0,
             pending_selection:  None,
+            focus_editor_frames_remaining: 3,
             scroll_y_px:        0.0,
             editor_height_px:   400.0,
         }
@@ -172,13 +177,13 @@ impl eframe::App for IrakNotesApp {
         // 4. Central editor (line numbers + text edit + scroll)
         self.show_editor(ctx);
 
-        // 5. All dialogs
-        self.process_find_dialog(ctx);
-        self.process_font_dialog(ctx);
-        self.process_size_dialog(ctx);
-        self.process_rename_dialog(ctx);
-        self.process_color_picker(ctx);
+        // 5. All dialogs - show them AFTER editor so they appear on top
         self.shortcuts_window.show(ctx);
+        self.find_dialog.show(ctx);
+        self.font_dialog.show(ctx, &self.font_family);
+        self.size_dialog.show(ctx);
+        self.rename_dialog.show(ctx);
+        self.color_picker.show(ctx);
 
         // 6. Confirm overlays
         self.show_exit_confirm_dialog(ctx);
@@ -186,6 +191,9 @@ impl eframe::App for IrakNotesApp {
 
         // 7. Auto-save (mirrors `<KeyRelease>` binding)
         self.do_auto_save();
+        
+        // 8. Process dialog results
+        self.process_dialogs(ctx);
     }
 }
 
@@ -253,7 +261,7 @@ impl IrakNotesApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(10.0);
                         ui.label(
-                            RichText::new(format!("Ln: {}, Col: {}", self.cursor_line, self.cursor_col))
+                            RichText::new(format!("Ln: {}, Col: {}", self.cursor_line, self.cursor_col + 1))
                                 .size(10.0)
                                 .color(Color32::from_rgb(0x2c, 0x3e, 0x50)),
                         );
@@ -266,10 +274,59 @@ impl IrakNotesApp {
 // ── main editor panel ─────────────────────────────────────────────────────────
 
 impl IrakNotesApp {
+    fn current_selection_range(
+        &self,
+        cursor_range: Option<egui::text::CursorRange>,
+    ) -> Option<(usize, usize)> {
+        cursor_range.and_then(|cr| {
+            let a = cr.primary.ccursor.index;
+            let b = cr.secondary.ccursor.index;
+            if a == b {
+                None
+            } else {
+                Some((a.min(b), a.max(b)))
+            }
+        })
+    }
+
+    fn insert_text_at_cursor(
+        &mut self,
+        cursor_range: Option<egui::text::CursorRange>,
+        text: &str,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let char_len = self.text_content.chars().count();
+        let insert_at = cursor_range
+            .map(|cr| cr.primary.ccursor.index.min(char_len))
+            .unwrap_or(char_len);
+        let byte_pos = char_to_byte_offset(&self.text_content, insert_at);
+        self.text_content.insert_str(byte_pos, text);
+        let new_pos = insert_at + text.chars().count();
+        self.pending_selection = Some((new_pos, new_pos));
+    }
+
     fn show_editor(&mut self, ctx: &Context) {
         // Line height: approximate `font.metrics('linespace')`
         let line_height = self.font_size * 1.5;
         let total_lines = self.text_content.lines().count().max(1);
+        let live_font_family = if self.font_dialog.open {
+            self.font_dialog.selected_font.clone()
+        } else {
+            self.font_family.clone()
+        };
+        let lower = live_font_family.to_lowercase();
+        let is_monospace = lower.contains("mono")
+            || lower.contains("consolas")
+            || lower.contains("courier")
+            || lower.contains("lucida console")
+            || lower.contains("liberation");
+        let editor_font = if is_monospace {
+            FontId::monospace(self.font_size)
+        } else {
+            FontId::proportional(self.font_size)
+        };
 
         egui::CentralPanel::default()
             .frame(
@@ -287,7 +344,7 @@ impl IrakNotesApp {
                     self.line_numbers.show(
                         ui,
                         total_lines,
-                        FontId::monospace(self.font_size),
+                        editor_font.clone(),
                         line_height,
                         self.scroll_y_px,   // ← Part 2: real live value
                         available_h,
@@ -320,7 +377,7 @@ impl IrakNotesApp {
                         .show(ui, |ui| {
                             let te = TextEdit::multiline(&mut self.text_content)
                                 .id(text_id)
-                                .font(FontId::monospace(self.font_size))
+                                .font(editor_font.clone())
                                 .text_color(self.fg_color)
                                 .frame(false)
                                 .desired_width(f32::INFINITY)
@@ -328,6 +385,10 @@ impl IrakNotesApp {
                                 .cursor_at_end(false);
 
                             let te_out = te.show(ui);
+                            if self.focus_editor_frames_remaining > 0 {
+                                te_out.response.request_focus();
+                                self.focus_editor_frames_remaining -= 1;
+                            }
 
                             // ── ① Cursor tracking (Part 2) ────────────────────
                             // Mirrors update_cursor_position():
@@ -339,6 +400,7 @@ impl IrakNotesApp {
                                     char_index_to_line_col(&self.text_content, char_idx);
                                 self.cursor_line = ln;
                                 self.cursor_col  = col;
+                                self.cursor_char_index = char_idx;
                             }
 
                             // Track content changes for is_saved flag
@@ -346,25 +408,39 @@ impl IrakNotesApp {
                                 self.is_saved = false;
                             }
 
-                            // Right-click context menu
-                            // Mirrors handle_right_click():
-                            //   selected_text → copy
-                            //   no selection  → paste
+                            let captured_cursor_range = te_out.cursor_range;
                             te_out.response.context_menu(|ui| {
-                                if ui.button("Copy").clicked() {
-                                    ctx.copy_text(self.text_content.clone());
-                                    self.status_msg = "Text copied to clipboard".to_string();
+                                let has_selection = captured_cursor_range.map_or(false, |cr| {
+                                    cr.primary.ccursor.index != cr.secondary.ccursor.index
+                                });
+
+                                if has_selection {
+                                    if ui.button("Copy").clicked() {
+                                        if let Some((start, end)) = self.current_selection_range(captured_cursor_range) {
+                                            let selected: String = self.text_content.chars().skip(start).take(end - start).collect();
+                                            ctx.copy_text(selected.clone());
+                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                let _ = clipboard.set_text(selected);
+                                            }
+                                            self.status_msg = "Text copied".to_string();
+                                        };
+                                        ui.close_menu();
+                                    }
+                                }
+
+                                if ui.button("Paste").clicked() {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        if let Ok(clip) = clipboard.get_text() {
+                                            self.insert_text_at_cursor(captured_cursor_range, &clip);
+                                            self.status_msg = "Text pasted".to_string();
+                                            self.is_saved = false;
+                                        }
+                                    }
                                     ui.close_menu();
                                 }
-                                if ui.button("Paste").clicked() {
-                                    // Insert clipboard text at cursor position
-                                    let clip = ui.output(|o| o.copied_text.clone());
-                                    if !clip.is_empty() {
-                                        // We can't directly insert at cursor from here;
-                                        // schedule insertion via pending approach
-                                        self.text_content.push_str(&clip);
-                                        self.status_msg = "Text pasted from clipboard".to_string();
-                                    }
+                                
+                                if ui.button("Select All").clicked() {
+                                    self.pending_selection = Some((0, self.text_content.chars().count()));
                                     ui.close_menu();
                                 }
                             });
@@ -384,106 +460,140 @@ impl IrakNotesApp {
 impl IrakNotesApp {
     /// Handles all key bindings exactly as listed in `SuperNotepad.__init__`.
     fn handle_keyboard(&mut self, ctx: &Context) {
+        let mut open_find = false;
+        let mut open_font = false;
+        let mut open_size = false;
+        let mut open_rename = false;
+        let mut open_color = false;
+        let mut open_shortcuts = false;
+        let mut new_file = false;
+        let mut open_folder = false;
+        let mut delete_file = false;
+        let mut close_app = false;
+        let mut go_top = false;
+        let mut go_bottom = false;
+        let mut go_line_start = false;
+        let mut go_line_end = false;
+        let mut zoom_in = false;
+        let mut zoom_out = false;
+        
         ctx.input_mut(|i| {
-            // Ctrl+Down  → go_to_last_line
-            if i.consume_key(Modifiers::CTRL, Key::ArrowDown) {
-                // Scroll the ScrollArea to the bottom next frame
-                // by setting a very large offset (clamped by egui)
-                self.scroll_y_px = f32::MAX;
-            }
+            if i.consume_key(egui::Modifiers::CTRL, Key::F) { open_find = true; }
+            if i.consume_key(egui::Modifiers::ALT, Key::F) { open_font = true; }
+            if i.consume_key(egui::Modifiers::ALT, Key::S) { open_size = true; }
+            if i.consume_key(egui::Modifiers::CTRL, Key::R) { open_rename = true; }
+            if i.consume_key(egui::Modifiers::CTRL, Key::N) { new_file = true; }
+            if i.consume_key(egui::Modifiers::CTRL, Key::O) { open_folder = true; }
+            if i.consume_key(egui::Modifiers::ALT, Key::Delete) { delete_file = true; }
+            if i.consume_key(egui::Modifiers::ALT, Key::Q) { close_app = true; }
+            if i.consume_key(egui::Modifiers::CTRL, Key::ArrowUp) { go_top = true; }
+            if i.consume_key(egui::Modifiers::CTRL, Key::ArrowDown) { go_bottom = true; }
+            if i.consume_key(egui::Modifiers::CTRL, Key::ArrowLeft) { go_line_start = true; }
+            if i.consume_key(egui::Modifiers::CTRL, Key::ArrowRight) { go_line_end = true; }
+            if i.consume_key(egui::Modifiers::NONE, Key::F1) { open_shortcuts = true; }
+            if i.consume_key(
+                egui::Modifiers { ctrl: true, shift: true, ..Default::default() },
+                Key::B
+            ) { open_color = true; }
 
-            // Ctrl+Up  → go_to_first_line
-            if i.consume_key(Modifiers::CTRL, Key::ArrowUp) {
-                self.scroll_y_px = 0.0;
-            }
-
-            // Ctrl+F  → find_text
-            if i.consume_key(Modifiers::CTRL, Key::F) {
-                self.find_dialog.open = true;
-            }
-
-            // Alt+F  → change_font
-            if i.consume_key(Modifiers::ALT, Key::F) {
-                self.font_dialog.open = true;
-            }
-
-            // Alt+S  → change_font_size
-            if i.consume_key(Modifiers::ALT, Key::S) {
-                self.size_dialog.size = self.font_size;
-                self.size_dialog.open = true;
-            }
-
-            // Alt+Delete  → delete_current_file
-            if i.consume_key(Modifiers::ALT, Key::Delete) {
-                self.show_delete_confirm = true;
-            }
-
-            // Ctrl+R  → rename_file
-            if i.consume_key(Modifiers::CTRL, Key::R) {
-                if let Some(ref p) = self.current_file {
-                    let name = p.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    self.rename_dialog.new_name     = name.clone();
-                    self.rename_dialog.current_name = name;
-                    self.rename_dialog.error_msg    = String::new();
-                    self.rename_dialog.open         = true;
-                }
-            }
-
-            // Ctrl+O  → open_save_folder
-            if i.consume_key(Modifiers::CTRL, Key::O) {
-                match file_ops::open_save_folder(&self.save_folder) {
-                    Ok(_)  => self.status_msg = "Save folder opened".to_string(),
-                    Err(e) => self.status_msg = format!("Error opening folder: {}", e),
-                }
-            }
-
-            // Alt+C  → close_app
-            if i.consume_key(Modifiers::ALT, Key::C) {
-                self.show_exit_confirm = true;
-            }
-
-            // Ctrl+N  → new_file
-            if i.consume_key(Modifiers::CTRL, Key::N) {
-                self.cmd_new_file();
-            }
-
-            // Ctrl+Alt+C  → change_background_color (Part 2: opens real picker)
-            // Must check alt+ctrl+C carefully (avoid collision with Ctrl+C copy)
-            if i.modifiers.ctrl && i.modifiers.alt && i.key_pressed(Key::C) {
-                i.consume_key(Modifiers::CTRL | Modifiers::ALT, Key::C);
-                self.color_picker.open_with(self.bg_color);
-            }
-
-            // F1  → show_shortcuts
-            if i.consume_key(Modifiers::NONE, Key::F1) {
-                self.shortcuts_window.open = true;
-            }
-
-            // ── Ctrl+MouseWheel → zoom (Part 2 fix) ──────────────────────────
-            // Mirrors `self.text.bind("<Control-MouseWheel>", self.zoom)`.
-            // egui's smooth_scroll_delta gives sub-pixel wheel increments;
-            // we threshold to avoid micro-adjustments.
-            if i.modifiers.ctrl {
-                let dy = i.smooth_scroll_delta.y;
-                if dy > 1.0 {
-                    self.font_size = (self.font_size + 1.0).min(72.0);
-                    settings::save_font_settings(
-                        &self.save_folder, &self.font_family, self.font_size);
-                    self.status_msg = format!("Font size: {}", self.font_size as i32);
-                    // Consume so the ScrollArea doesn't also scroll
-                    i.smooth_scroll_delta.y = 0.0;
-                } else if dy < -1.0 {
-                    self.font_size = (self.font_size - 1.0).max(6.0);
-                    settings::save_font_settings(
-                        &self.save_folder, &self.font_family, self.font_size);
-                    self.status_msg = format!("Font size: {}", self.font_size as i32);
-                    i.smooth_scroll_delta.y = 0.0;
+            for event in &i.events {
+                if let egui::Event::MouseWheel { delta, modifiers, .. } = event {
+                    if modifiers.ctrl {
+                        if delta.y > 0.0 { zoom_in = true; }
+                        else if delta.y < 0.0 { zoom_out = true; }
+                    }
                 }
             }
         });
+        
+        // Apply actions
+        if open_find {
+            self.find_dialog.open = true;
+            self.find_dialog.focus_query_next_frame = true;
+            self.focus_editor_frames_remaining = 0;
+        }
+        if open_font {
+            self.font_dialog.open = true;
+        }
+        if open_size {
+            self.size_dialog.size = self.font_size;
+            self.size_dialog.open = true;
+        }
+        if open_rename {
+            if let Some(ref p) = self.current_file {
+                let name = p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.rename_dialog.new_name = name.clone();
+                self.rename_dialog.current_name = name;
+                self.rename_dialog.error_msg = String::new();
+                self.rename_dialog.open = true;
+                self.rename_dialog.focus_name_next_frame = true;
+                self.focus_editor_frames_remaining = 0;
+            }
+        }
+        if open_color {
+            self.color_picker.open_with(self.bg_color);
+        }
+        if open_shortcuts {
+            self.shortcuts_window.open = true;
+        }
+        if new_file {
+            self.cmd_new_file();
+        }
+        if open_folder {
+            match file_ops::open_save_folder(&self.save_folder) {
+                Ok(_) => self.status_msg = "Save folder opened".to_string(),
+                Err(e) => self.status_msg = format!("Error: {}", e),
+            }
+        }
+        if delete_file {
+            self.show_delete_confirm = true;
+        }
+        if close_app {
+            self.show_exit_confirm = true;
+        }
+        if go_top {
+            self.pending_selection = Some((0, 0));
+            self.scroll_y_px = 0.0;
+        }
+        if go_bottom {
+            let len = self.text_content.chars().count();
+            self.pending_selection = Some((len, len));
+        }
+        if go_line_start {
+            let (line, _) = char_index_to_line_col(&self.text_content, self.cursor_char_index);
+            let absolute_start = line_start_char_index(&self.text_content, line);
+            let smart_start = line_first_non_whitespace_char_index(&self.text_content, line);
+            let target = if self.cursor_char_index == smart_start {
+                absolute_start
+            } else {
+                smart_start
+            };
+            self.pending_selection = Some((target, target));
+        }
+        if go_line_end {
+            let (line, _) = char_index_to_line_col(&self.text_content, self.cursor_char_index);
+            let absolute_end = line_end_char_index(&self.text_content, line);
+            let smart_end = line_last_non_whitespace_char_index(&self.text_content, line);
+            let target = if self.cursor_char_index == smart_end {
+                absolute_end
+            } else {
+                smart_end
+            };
+            self.pending_selection = Some((target, target));
+        }
+        if zoom_in {
+            self.font_size = (self.font_size + 1.0).min(72.0);
+            settings::save_font_settings(&self.save_folder, &self.font_family, self.font_size);
+            self.status_msg = format!("Font size: {}", self.font_size as i32);
+        }
+        if zoom_out {
+            self.font_size = (self.font_size - 1.0).max(6.0);
+            settings::save_font_settings(&self.save_folder, &self.font_family, self.font_size);
+            self.status_msg = format!("Font size: {}", self.font_size as i32);
+        }
     }
 }
 
@@ -524,153 +634,103 @@ impl IrakNotesApp {
             }
         }
     }
-}
-
-// ── dialog processing ─────────────────────────────────────────────────────────
-
-impl IrakNotesApp {
-    // ── Find ────────────────────────────────────────────────────────────────
-
-    /// Mirrors `find_text()` + inner `find_next()`.
-    fn process_find_dialog(&mut self, ctx: &Context) {
-        self.find_dialog.show(ctx);
-
-        if !self.find_dialog.find_requested { return; }
-
-        let query = self.find_dialog.query.clone();
-        if query.is_empty() {
-            self.find_dialog.result_msg = "Please enter search text".to_string();
-            return;
-        }
-
-        let content  = self.text_content.clone();
-        // Work in char-space for accurate CCursor index
-        let char_len = content.chars().count();
-        let start_ci = self.find_char_offset.min(char_len);
-
-        // Byte offset of search start (for str::find)
-        let start_byte = char_to_byte_offset(&content, start_ci);
-
-        let search = |hay: &str| -> Option<usize> {
-            // Returns *byte* offset within `hay`
-            if self.find_dialog.match_case {
-                hay.find(query.as_str())
+    
+    /// Process all dialog results
+    fn process_dialogs(&mut self, _ctx: &Context) {
+        // Process find dialog
+        if self.find_dialog.find_requested {
+            let query = self.find_dialog.query.clone();
+            self.find_dialog.find_requested = false;
+            if query.is_empty() {
+                self.find_dialog.result_msg = "Please enter search text".to_string();
             } else {
-                let h = hay.to_lowercase();
-                let n = query.to_lowercase();
-                h.find(n.as_str())
-            }
-        };
+                let content = self.text_content.clone();
+                let char_len = content.chars().count();
+                let start_ci = self.find_char_offset.min(char_len);
+                let start_byte = char_to_byte_offset(&content, start_ci);
 
-        // Search forward from current position (mirrors `stopindex=tk.END`)
-        let found_byte = search(&content[start_byte..])
-            .map(|b| b + start_byte)
-            // Wrap: search from beginning (mirrors the wrap block)
-            .or_else(|| search(&content[..start_byte]));
-
-        match found_byte {
-            Some(byte_start) => {
-                let byte_end    = (byte_start + query.len()).min(content.len());
-                // Convert to char indices for CCursor (Part 2 improvement)
-                let char_start  = byte_to_char_index(&content, byte_start);
-                let char_end    = byte_to_char_index(&content, byte_end);
-                let (ln, col)   = char_index_to_line_col(&content, char_start);
-
-                self.find_dialog.found_range = Some((char_start, char_end));
-                self.find_dialog.result_msg  =
-                    format!("Found at Ln: {}, Col: {}", ln, col);
-                // Advance offset past this match (mirrors `mark_set(INSERT, end_pos)`)
-                self.find_char_offset = char_end;
-                // Schedule selection highlight (Part 2 ④)
-                self.pending_selection = Some((char_start, char_end));
-                self.status_msg = format!("Found: \"{}\" at Ln {}, Col {}", query, ln, col);
-            }
-            None => {
-                self.find_dialog.found_range = None;
-                self.find_dialog.result_msg  = format!("'{}' not found", query);
-                self.find_char_offset = 0; // reset for next attempt
-                self.status_msg = format!("'{}' not found", query);
-            }
-        }
-    }
-
-    // ── Font ────────────────────────────────────────────────────────────────
-
-    /// Mirrors `change_font()` + `apply_font()`.
-    fn process_font_dialog(&mut self, ctx: &Context) {
-        let current = self.font_family.clone();
-        self.font_dialog.show(ctx, &current);
-
-        if let Some(new_family) = self.font_dialog.apply.take() {
-            self.font_family = new_family.clone();
-            settings::save_font_settings(&self.save_folder, &new_family, self.font_size);
-            self.status_msg = format!("Font changed to {}", new_family);
-        }
-    }
-
-    // ── Font Size ────────────────────────────────────────────────────────────
-
-    /// Mirrors `change_font_size()` + `apply_size()`.
-    fn process_size_dialog(&mut self, ctx: &Context) {
-        self.size_dialog.show(ctx);
-
-        if let Some(new_size) = self.size_dialog.apply.take() {
-            self.font_size = new_size;
-            settings::save_font_settings(&self.save_folder, &self.font_family, new_size);
-            self.status_msg = format!("Font size changed to {}", new_size as i32);
-        }
-    }
-
-    // ── Rename ───────────────────────────────────────────────────────────────
-
-    /// Mirrors `rename_file()` + `validate_and_rename()`.
-    fn process_rename_dialog(&mut self, ctx: &Context) {
-        self.rename_dialog.show(ctx);
-
-        if let Some(new_name) = self.rename_dialog.apply.take() {
-            if let Some(ref current) = self.current_file.clone() {
-                match file_ops::rename_file(current, &self.save_folder, &new_name) {
-                    Ok(new_path) => {
-                        let name = new_path.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        self.current_file            = Some(new_path);
-                        self.is_saved                = true;
-                        self.rename_dialog.open      = false;
-                        self.rename_dialog.error_msg = String::new();
-                        self.status_msg              = format!("File renamed to {}", name);
+                let search = |hay: &str| -> Option<usize> {
+                    if self.find_dialog.match_case {
+                        hay.find(query.as_str())
+                    } else {
+                        hay.to_lowercase().find(query.to_lowercase().as_str())
                     }
-                    Err(e) => {
-                        self.rename_dialog.error_msg = format!("Error: {}", e);
+                };
+
+                let found_byte = search(&content[start_byte..])
+                    .map(|b| b + start_byte)
+                    .or_else(|| if start_byte > 0 { search(&content[..start_byte]) } else { None });
+
+                match found_byte {
+                    Some(byte_start) => {
+                        let byte_end   = (byte_start + query.len()).min(content.len());
+                        let char_start = byte_to_char_index(&content, byte_start);
+                        let char_end   = byte_to_char_index(&content, byte_end);
+                        let (ln, col)  = char_index_to_line_col(&content, char_start);
+                        let total_col  = line_total_cols(&content, ln);
+                        let col_1based = col + 1;
+
+                        self.find_dialog.result_msg = format!(
+                            "Found at Line {}, Column {}/{}",
+                            ln, col_1based, total_col
+                        );
+                        self.status_msg = format!(
+                            "Found: \"{}\" at Line {}, Col {}",
+                            query, ln, col_1based
+                        );
+                        self.find_char_offset = char_end;
+                        self.pending_selection = Some((char_start, char_end));
+                    }
+                    None => {
+                        self.find_dialog.result_msg = format!("\"{}\" not found", query);
+                        self.status_msg = format!("\"{}\" not found", query);
+                        self.find_char_offset = 0;
                     }
                 }
             }
         }
-    }
-
-    // ── Colour Picker (Part 2) ────────────────────────────────────────────────
-
-    /// Mirrors `change_background_color()` (Ctrl+Alt+C).
-    ///
-    /// Python:
-    ///   color = colorchooser.askcolor(...)
-    ///   if color and color[1]:
-    ///       self.text.configure(bg=bg_color)
-    ///       text_color = "#000000" if is_light_color(bg_color) else "#ffffff"
-    ///       self.text.configure(fg=text_color)
-    ///       self.save_color_settings(bg_color)
-    fn process_color_picker(&mut self, ctx: &Context) {
-        self.color_picker.show(ctx);
-
+        
+        // Process font dialog
+        if let Some(new_font) = self.font_dialog.apply.take() {
+            self.font_family = new_font.clone();
+            settings::save_font_settings(&self.save_folder, &new_font, self.font_size);
+            self.status_msg = format!("Font: {}", new_font);
+        }
+        
+        // Process size dialog
+        if let Some(new_size) = self.size_dialog.apply.take() {
+            self.font_size = new_size;
+            settings::save_font_settings(&self.save_folder, &self.font_family, new_size);
+            self.status_msg = format!("Font size: {}", new_size as i32);
+        }
+        
+        // Process rename dialog
+        if let Some(new_name) = self.rename_dialog.apply.take() {
+            if let Some(ref current) = self.current_file.clone() {
+                match file_ops::rename_file(current, &self.save_folder, &new_name) {
+                    Ok(new_path) => {
+                        self.current_file = Some(new_path);
+                        self.rename_dialog.open = false;
+                        self.status_msg = format!("Renamed to: {}", new_name);
+                    }
+                    Err(e) => {
+                        self.rename_dialog.error_msg = e;
+                    }
+                }
+            }
+        }
+        
+        // Process color picker
         if let Some(new_bg) = self.color_picker.applied.take() {
-            self.bg_color   = new_bg;
-            self.fg_color   = settings::fg_for_bg(new_bg);
+            self.bg_color = new_bg;
+            self.fg_color = settings::fg_for_bg(new_bg);
             settings::save_color_settings(&self.save_folder, new_bg);
             self.status_msg = "Background color changed".to_string();
         }
     }
+}
 
+impl IrakNotesApp {
     // ── Exit confirm ─────────────────────────────────────────────────────────
 
     /// Mirrors `messagebox.askyesno("Exit", ...)` in `close_app()`.
@@ -776,6 +836,75 @@ pub fn char_index_to_line_col(text: &str, char_idx: usize) -> (usize, usize) {
         }
     }
     (line, col)
+}
+
+fn line_start_char_index(text: &str, line_1_based: usize) -> usize {
+    if line_1_based <= 1 {
+        return 0;
+    }
+    let mut current_line = 1usize;
+    let mut idx = 0usize;
+    for ch in text.chars() {
+        if current_line == line_1_based {
+            break;
+        }
+        idx += 1;
+        if ch == '\n' {
+            current_line += 1;
+        }
+    }
+    idx
+}
+
+fn line_end_char_index(text: &str, line_1_based: usize) -> usize {
+    let mut current_line = 1usize;
+    let mut idx = 0usize;
+    for ch in text.chars() {
+        if current_line == line_1_based && ch == '\n' {
+            return idx;
+        }
+        idx += 1;
+        if ch == '\n' {
+            current_line += 1;
+        }
+    }
+    idx
+}
+
+fn line_first_non_whitespace_char_index(text: &str, line_1_based: usize) -> usize {
+    let start = line_start_char_index(text, line_1_based);
+    let end   = line_end_char_index(text, line_1_based);
+    if end <= start { return start; }
+
+    let mut offset = 0usize;
+    for ch in text.chars().skip(start).take(end - start) {
+        if !ch.is_whitespace() {
+            return start + offset;
+        }
+        offset += 1;
+    }
+    start
+}
+
+fn line_last_non_whitespace_char_index(text: &str, line_1_based: usize) -> usize {
+    let start = line_start_char_index(text, line_1_based);
+    let end   = line_end_char_index(text, line_1_based);
+    if end <= start { return end; }
+
+    let chars: Vec<char> = text.chars().skip(start).take(end - start).collect();
+
+    for idx in (0..chars.len()).rev() {
+        if !chars[idx].is_whitespace() {
+            return start + idx + 1;
+        }
+    }
+    end
+}
+
+fn line_total_cols(text: &str, line_1_based: usize) -> usize {
+    let start = line_start_char_index(text, line_1_based);
+    let end = line_end_char_index(text, line_1_based);
+    end.saturating_sub(start)
 }
 
 /// Convert a **byte offset** in `text` to a **char index**.
