@@ -113,47 +113,41 @@ impl LineNumbers {
             Stroke::new(1.0, self.sep_color),
         );
 
-        if line_height_px <= 0.0 || visible_height <= 0.0 {
+        if line_height_px <= 0.0 || visible_height <= 0.0 || total_lines == 0 {
             return gutter_w;
         }
 
-        // ── determine visible line range from live scroll position ────────────
+        // ── draw line numbers for actual text lines only ──────────────────────
+        //
+        // Unlike the previous version that calculated visible lines from scroll position,
+        // we now simply draw all line numbers at their logical positions.
+        // This ensures each actual line (separated by \n) gets exactly one line number,
+        // regardless of text wrapping.
         //
         // Python equivalent:
-        //   first_line = int(text.index("@0,0").split(".")[0])
-        //   last_line  = int(text.index(f"@0,{height}").split(".")[0]) + 1
-        //
-        // We derive this from `scroll_y_px` and `line_height_px`.
-        let first_line  = (scroll_y_px / line_height_px).floor() as usize + 1;
-        let visible_rows = (visible_height / line_height_px).ceil() as usize + 2;
-        let last_line   = (first_line + visible_rows - 1).min(total_lines);
-
-        // Sub-line fractional offset keeps digits in step with text rows
-        let sub_offset = (scroll_y_px % line_height_px).max(0.0);
-
-        // ── draw each visible line number ─────────────────────────────────────
-        //
-        // Python:
-        //   for line in range(first_line, last_line):
+        //   for line in range(1, total_lines + 1):
         //       dline = self.text_widget.dlineinfo(f"{line}.0")
         //       if dline:
         //           y = dline[1]
         //           self.create_text(width-5, y, anchor="ne", text=str(line), ...)
-        for line in first_line..=last_line {
-            let y = gutter_rect.top()
-                + TOP_OFFSET
-                + (line - first_line) as f32 * line_height_px
-                - sub_offset;
+        
+        for line_num in 1..=total_lines {
+            // Calculate Y position for this logical line
+            // Each logical line starts at (line_num - 1) * line_height_px
+            let logical_y = (line_num - 1) as f32 * line_height_px;
+            
+            // Adjust for scroll offset
+            let y = gutter_rect.top() + TOP_OFFSET + logical_y - scroll_y_px;
 
-            // Clip outside gutter bounds
+            // Skip if outside visible area (with some margin for smooth scrolling)
             if y > gutter_rect.bottom() + line_height_px {
-                break;
+                continue;
             }
-            if y + line_height_px < gutter_rect.top() {
+            if y + line_height_px < gutter_rect.top() - line_height_px {
                 continue;
             }
 
-            let label  = format!("{}", line);
+            let label  = format!("{}", line_num);
             let galley = ui.fonts(|fonts| {
                 fonts.layout_no_wrap(label, font_id.clone(), self.fg_color)
             });

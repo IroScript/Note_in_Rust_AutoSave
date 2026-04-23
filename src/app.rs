@@ -1,31 +1,19 @@
 // ============================================================
-//  app.rs  (Part 2 – cursor tracking, scroll-sync, colour picker,
-//           find-highlight, zoom fix)
+//  app.rs  –  Fixed version
 //
-//  Every Python method is preserved from Part 1.
-//  Part 2 additions / fixes:
-//
-//  ① Cursor tracking  – TextEdit::show() → output.cursor_range
-//                       → char_index_to_line_col()
-//                       Mirrors update_cursor_position() exactly.
-//
-//  ② Scroll sync      – ScrollArea output → state.offset.y
-//                       fed into LineNumbers::show() as scroll_y_px.
-//                       Mirrors the dlineinfo() y-values in update_line_numbers().
-//
-//  ③ Colour picker    – ColorPickerDialog (color_picker.rs) replaces
-//                       the preset-cycling placeholder from Part 1.
-//                       Mirrors colorchooser.askcolor() exactly.
-//
-//  ④ Find-highlight   – After a successful find the TextEdit cursor
-//                       range is set via TextEdit::load_state / store
-//                       to select the found text.
-//                       Mirrors `self.text.tag_add("found", ...)` +
-//                       `self.text.mark_set(INSERT, end_pos)`.
-//
-//  ⑤ Zoom fix         – consume_key now also handles raw scroll-wheel
-//                       events with Ctrl held, exactly like the Python
-//                       `<Control-MouseWheel>` binding.
+//  Fixes applied:
+//    1. Right-click: selection → copy, no selection → paste (no context menu)
+//    2. Ctrl+Up → go to first line (top), Ctrl+Down → go to last line (bottom)
+//    3. Ctrl+Left → go to start of CURRENT line, Ctrl+Right → go to end of CURRENT line
+//       (no crash, no smart navigation)
+//    4. Find text shows "Line N, Column C/Total"
+//    5. Opening the app auto-focuses editor with blinking cursor
+//    6. Ctrl+F focuses find input with blinking cursor
+//    7. Ctrl+R focuses rename input with blinking cursor
+//    8. Font change applies visually to the editor
+//    9. Ctrl+mouse wheel zoom works
+//   10. Background color shortcut changed to Ctrl+Shift+B
+//       (Ctrl+Alt+C conflicts with Windows Copilot global hotkey)
 // ============================================================
 
 use egui::{
@@ -71,7 +59,7 @@ pub struct IrakNotesApp {
     font_dialog:        FontDialog,
     size_dialog:        FontSizeDialog,
     rename_dialog:      RenameDialog,
-    color_picker:       ColorPickerDialog, // ← Part 2: real picker
+    color_picker:       ColorPickerDialog,
     shortcuts_window:   ShortcutsWindow,
 
     // ── confirm overlays ─────────────────────────────────────────────────────
@@ -87,7 +75,7 @@ pub struct IrakNotesApp {
     /// Give keyboard focus to the main editor for N upcoming frames.
     focus_editor_frames_remaining: u8,
 
-    // ── scroll / line-number sync (Part 2) ───────────────────────────────────
+    // ── scroll / line-number sync ────────────────────────────────────────────
     /// Live scroll-Y pixel offset read from the ScrollArea state last frame.
     scroll_y_px:        f32,
     /// Pixel height of the visible editor area last frame.
@@ -126,7 +114,6 @@ impl IrakNotesApp {
             &font_family,
         );
         let size_dialog  = FontSizeDialog::new(font_size, &font_family);
-        // Part 2: real colour picker with current bg as initial colour
         let color_picker = ColorPickerDialog::new(bg_color);
 
         Self {
@@ -154,7 +141,8 @@ impl IrakNotesApp {
             show_delete_confirm: false,
             find_char_offset:   0,
             pending_selection:  None,
-            focus_editor_frames_remaining: 3,
+            // FIX #5: Auto-focus the editor on startup (give it enough frames)
+            focus_editor_frames_remaining: 10,
             scroll_y_px:        0.0,
             editor_height_px:   400.0,
         }
@@ -307,10 +295,7 @@ impl IrakNotesApp {
         self.pending_selection = Some((new_pos, new_pos));
     }
 
-    fn show_editor(&mut self, ctx: &Context) {
-        // Line height: approximate `font.metrics('linespace')`
-        let line_height = self.font_size * 1.5;
-        let total_lines = self.text_content.lines().count().max(1);
+    fn resolve_editor_font(&self) -> FontId {
         let live_font_family = if self.font_dialog.open {
             self.font_dialog.selected_font.clone()
         } else {
@@ -322,11 +307,18 @@ impl IrakNotesApp {
             || lower.contains("courier")
             || lower.contains("lucida console")
             || lower.contains("liberation");
-        let editor_font = if is_monospace {
+        if is_monospace {
             FontId::monospace(self.font_size)
         } else {
             FontId::proportional(self.font_size)
-        };
+        }
+    }
+
+    fn show_editor(&mut self, ctx: &Context) {
+        // Line height: approximate `font.metrics('linespace')`
+        let line_height = self.font_size * 1.5;
+        let total_lines = self.text_content.lines().count().max(1);
+        let editor_font = self.resolve_editor_font();
 
         egui::CentralPanel::default()
             .frame(
@@ -339,28 +331,23 @@ impl IrakNotesApp {
 
                 ui.horizontal_top(|ui| {
                     // ── ① Line numbers gutter ─────────────────────────────────
-                    // Uses scroll_y_px from *last frame* (one-frame lag is standard
-                    // in immediate-mode UIs and imperceptible at 60 fps).
                     self.line_numbers.show(
                         ui,
                         total_lines,
                         editor_font.clone(),
                         line_height,
-                        self.scroll_y_px,   // ← Part 2: real live value
+                        self.scroll_y_px,
                         available_h,
                     );
 
                     // ── ② Scrollable text editor ──────────────────────────────
                     let text_id = egui::Id::new("main_text_edit");
 
-                    // Part 2 ④: apply a pending selection (find-highlight)
+                    // Apply a pending selection (find-highlight, navigation)
                     if let Some((sel_start, sel_end)) = self.pending_selection.take() {
                         if let Some(mut state) =
                             egui::TextEdit::load_state(ctx, text_id)
                         {
-                            // Build a CursorRange that selects [sel_start, sel_end]
-                            // mirrors: text.tag_add("found", start_pos, end_pos)
-                            //          text.mark_set(INSERT, end_pos)
                             use egui::text::CCursor;
                             let primary   = egui::text::CCursorRange {
                                 primary:   CCursor { index: sel_end,   prefer_next_row: false },
@@ -381,19 +368,17 @@ impl IrakNotesApp {
                                 .text_color(self.fg_color)
                                 .frame(false)
                                 .desired_width(f32::INFINITY)
-                                // Blue cursor (mirrors insertbackground="#3498db")
                                 .cursor_at_end(false);
 
                             let te_out = te.show(ui);
+                            
+                            // FIX #5, #6, #7: Auto-focus editor with blinking cursor
                             if self.focus_editor_frames_remaining > 0 {
                                 te_out.response.request_focus();
                                 self.focus_editor_frames_remaining -= 1;
                             }
 
-                            // ── ① Cursor tracking (Part 2) ────────────────────
-                            // Mirrors update_cursor_position():
-                            //   position = self.text.index(tk.INSERT)
-                            //   line, column = position.split('.')
+                            // ── Cursor tracking ────────────────────────────────
                             if let Some(cr) = te_out.cursor_range {
                                 let char_idx = cr.primary.ccursor.index;
                                 let (ln, col) =
@@ -408,46 +393,46 @@ impl IrakNotesApp {
                                 self.is_saved = false;
                             }
 
+                            // FIX #1: Right-click handler
+                            // Right-click with selection → copy to clipboard
+                            // Right-click without selection → paste from clipboard
+                            // No context menu, exactly like Python's handle_right_click
                             let captured_cursor_range = te_out.cursor_range;
-                            te_out.response.context_menu(|ui| {
+                            if te_out.response.secondary_clicked() {
                                 let has_selection = captured_cursor_range.map_or(false, |cr| {
                                     cr.primary.ccursor.index != cr.secondary.ccursor.index
                                 });
 
                                 if has_selection {
-                                    if ui.button("Copy").clicked() {
-                                        if let Some((start, end)) = self.current_selection_range(captured_cursor_range) {
-                                            let selected: String = self.text_content.chars().skip(start).take(end - start).collect();
-                                            ctx.copy_text(selected.clone());
-                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                let _ = clipboard.set_text(selected);
-                                            }
-                                            self.status_msg = "Text copied".to_string();
-                                        };
-                                        ui.close_menu();
+                                    // Copy selected text
+                                    if let Some((start, end)) = self.current_selection_range(captured_cursor_range) {
+                                        let selected: String = self.text_content.chars().skip(start).take(end - start).collect();
+                                        ctx.copy_text(selected.clone());
+                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                            let _ = clipboard.set_text(selected);
+                                        }
+                                        self.status_msg = "Text copied to clipboard".to_string();
                                     }
-                                }
-
-                                if ui.button("Paste").clicked() {
+                                } else {
+                                    // Paste from clipboard
                                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                         if let Ok(clip) = clipboard.get_text() {
-                                            self.insert_text_at_cursor(captured_cursor_range, &clip);
-                                            self.status_msg = "Text pasted".to_string();
-                                            self.is_saved = false;
+                                            if !clip.is_empty() {
+                                                self.insert_text_at_cursor(captured_cursor_range, &clip);
+                                                self.status_msg = "Text pasted from clipboard".to_string();
+                                                self.is_saved = false;
+                                            } else {
+                                                self.status_msg = "Clipboard is empty".to_string();
+                                            }
+                                        } else {
+                                            self.status_msg = "Clipboard is empty".to_string();
                                         }
                                     }
-                                    ui.close_menu();
                                 }
-                                
-                                if ui.button("Select All").clicked() {
-                                    self.pending_selection = Some((0, self.text_content.chars().count()));
-                                    ui.close_menu();
-                                }
-                            });
+                            }
                         });
 
-                    // ── ② Capture scroll offset for next frame (Part 2) ───────
-                    // Mirrors the y-coordinate dlineinfo() returns for each line.
+                    // Capture scroll offset for next frame
                     self.scroll_y_px      = scroll_out.state.offset.y;
                     self.editor_height_px = available_h;
                 });
@@ -478,31 +463,51 @@ impl IrakNotesApp {
         let mut zoom_out = false;
         
         ctx.input_mut(|i| {
+            // FIX #6: Ctrl+F → open find dialog and focus entry
             if i.consume_key(egui::Modifiers::CTRL, Key::F) { open_find = true; }
+            // FIX #8: Alt+F → open font dialog
             if i.consume_key(egui::Modifiers::ALT, Key::F) { open_font = true; }
             if i.consume_key(egui::Modifiers::ALT, Key::S) { open_size = true; }
+            // FIX #7: Ctrl+R → open rename dialog and focus entry
             if i.consume_key(egui::Modifiers::CTRL, Key::R) { open_rename = true; }
             if i.consume_key(egui::Modifiers::CTRL, Key::N) { new_file = true; }
             if i.consume_key(egui::Modifiers::CTRL, Key::O) { open_folder = true; }
             if i.consume_key(egui::Modifiers::ALT, Key::Delete) { delete_file = true; }
             if i.consume_key(egui::Modifiers::ALT, Key::Q) { close_app = true; }
+            
+            // FIX #2: Ctrl+Up → first line, Ctrl+Down → last line
             if i.consume_key(egui::Modifiers::CTRL, Key::ArrowUp) { go_top = true; }
             if i.consume_key(egui::Modifiers::CTRL, Key::ArrowDown) { go_bottom = true; }
+            
+            // FIX #3: Ctrl+Left → start of current line, Ctrl+Right → end of current line
             if i.consume_key(egui::Modifiers::CTRL, Key::ArrowLeft) { go_line_start = true; }
             if i.consume_key(egui::Modifiers::CTRL, Key::ArrowRight) { go_line_end = true; }
+            
             if i.consume_key(egui::Modifiers::NONE, Key::F1) { open_shortcuts = true; }
+            
+            // FIX #10: Ctrl+Shift+B for background color
+            // (Ctrl+Alt+C conflicts with Windows 10 Copilot global hotkey)
             if i.consume_key(
                 egui::Modifiers { ctrl: true, shift: true, ..Default::default() },
                 Key::B
             ) { open_color = true; }
 
-            for event in &i.events {
+            // FIX #9: Ctrl+MouseWheel zoom
+            // We must remove the scroll events from the list to prevent them
+            // from also scrolling the editor
+            let mut consumed_indices = Vec::new();
+            for (idx, event) in i.events.iter().enumerate() {
                 if let egui::Event::MouseWheel { delta, modifiers, .. } = event {
                     if modifiers.ctrl {
                         if delta.y > 0.0 { zoom_in = true; }
                         else if delta.y < 0.0 { zoom_out = true; }
+                        consumed_indices.push(idx);
                     }
                 }
+            }
+            // Remove consumed scroll events in reverse order to preserve indices
+            for idx in consumed_indices.into_iter().rev() {
+                i.events.remove(idx);
             }
         });
         
@@ -510,6 +515,7 @@ impl IrakNotesApp {
         if open_find {
             self.find_dialog.open = true;
             self.find_dialog.focus_query_next_frame = true;
+            // FIX #6: Stop focusing the editor so the find dialog entry gets focus
             self.focus_editor_frames_remaining = 0;
         }
         if open_font {
@@ -529,6 +535,7 @@ impl IrakNotesApp {
                 self.rename_dialog.current_name = name;
                 self.rename_dialog.error_msg = String::new();
                 self.rename_dialog.open = true;
+                // FIX #7: Focus the rename entry with blinking cursor
                 self.rename_dialog.focus_name_next_frame = true;
                 self.focus_editor_frames_remaining = 0;
             }
@@ -554,36 +561,44 @@ impl IrakNotesApp {
         if close_app {
             self.show_exit_confirm = true;
         }
+        
+        // FIX #2: Ctrl+Up → go to first line (position 0)
         if go_top {
             self.pending_selection = Some((0, 0));
             self.scroll_y_px = 0.0;
+            self.status_msg = "Go to first line".to_string();
         }
+        
+        // FIX #2: Ctrl+Down → go to last line (end of text)
         if go_bottom {
             let len = self.text_content.chars().count();
             self.pending_selection = Some((len, len));
+            self.status_msg = "Go to last line".to_string();
         }
+        
+        // FIX #3: Ctrl+Left → go to start of current line
+        // Mirrors Python: go_to_line_start
+        //   current_pos = self.text.index(tk.INSERT)
+        //   line_start = current_pos.split('.')[0] + ".0"
+        //   self.text.mark_set(tk.INSERT, line_start)
         if go_line_start {
-            let (line, _) = char_index_to_line_col(&self.text_content, self.cursor_char_index);
-            let absolute_start = line_start_char_index(&self.text_content, line);
-            let smart_start = line_first_non_whitespace_char_index(&self.text_content, line);
-            let target = if self.cursor_char_index == smart_start {
-                absolute_start
-            } else {
-                smart_start
-            };
+            let (line, _col) = char_index_to_line_col(&self.text_content, self.cursor_char_index);
+            let target = line_start_char_index(&self.text_content, line);
             self.pending_selection = Some((target, target));
         }
+        
+        // FIX #3: Ctrl+Right → go to end of current line
+        // Mirrors Python: go_to_line_end
+        //   current_pos = self.text.index(tk.INSERT)
+        //   line_end = current_pos.split('.')[0] + ".end"
+        //   self.text.mark_set(tk.INSERT, line_end)
         if go_line_end {
-            let (line, _) = char_index_to_line_col(&self.text_content, self.cursor_char_index);
-            let absolute_end = line_end_char_index(&self.text_content, line);
-            let smart_end = line_last_non_whitespace_char_index(&self.text_content, line);
-            let target = if self.cursor_char_index == smart_end {
-                absolute_end
-            } else {
-                smart_end
-            };
+            let (line, _col) = char_index_to_line_col(&self.text_content, self.cursor_char_index);
+            let target = line_end_char_index(&self.text_content, line);
             self.pending_selection = Some((target, target));
         }
+        
+        // FIX #9: Zoom in/out with Ctrl+MouseWheel
         if zoom_in {
             self.font_size = (self.font_size + 1.0).min(72.0);
             settings::save_font_settings(&self.save_folder, &self.font_family, self.font_size);
@@ -613,6 +628,8 @@ impl IrakNotesApp {
                 self.is_saved           = true;
                 self.find_char_offset   = 0;
                 self.status_msg         = "New file created".to_string();
+                // Focus editor after creating new file
+                self.focus_editor_frames_remaining = 5;
             }
             Err(e) => {
                 self.status_msg = format!("Failed to create new file: {}", e);
@@ -638,6 +655,7 @@ impl IrakNotesApp {
     /// Process all dialog results
     fn process_dialogs(&mut self, _ctx: &Context) {
         // Process find dialog
+        // FIX #4: Find text shows "Line N, Column C/Total"
         if self.find_dialog.find_requested {
             let query = self.find_dialog.query.clone();
             self.find_dialog.find_requested = false;
@@ -670,6 +688,7 @@ impl IrakNotesApp {
                         let total_col  = line_total_cols(&content, ln);
                         let col_1based = col + 1;
 
+                        // FIX #4: Show "Line N, Column C/Total" instead of character position
                         self.find_dialog.result_msg = format!(
                             "Found at Line {}, Column {}/{}",
                             ln, col_1based, total_col
@@ -680,6 +699,8 @@ impl IrakNotesApp {
                         );
                         self.find_char_offset = char_end;
                         self.pending_selection = Some((char_start, char_end));
+                        // Focus the editor to show the selection
+                        self.focus_editor_frames_remaining = 3;
                     }
                     None => {
                         self.find_dialog.result_msg = format!("\"{}\" not found", query);
@@ -690,11 +711,13 @@ impl IrakNotesApp {
             }
         }
         
-        // Process font dialog
+        // FIX #8: Process font dialog — apply the font change visually
         if let Some(new_font) = self.font_dialog.apply.take() {
             self.font_family = new_font.clone();
             settings::save_font_settings(&self.save_folder, &new_font, self.font_size);
-            self.status_msg = format!("Font: {}", new_font);
+            self.status_msg = format!("Font changed to: {}", new_font);
+            // Give focus back to editor after font change
+            self.focus_editor_frames_remaining = 3;
         }
         
         // Process size dialog
@@ -702,6 +725,7 @@ impl IrakNotesApp {
             self.font_size = new_size;
             settings::save_font_settings(&self.save_folder, &self.font_family, new_size);
             self.status_msg = format!("Font size: {}", new_size as i32);
+            self.focus_editor_frames_remaining = 3;
         }
         
         // Process rename dialog
@@ -712,6 +736,8 @@ impl IrakNotesApp {
                         self.current_file = Some(new_path);
                         self.rename_dialog.open = false;
                         self.status_msg = format!("Renamed to: {}", new_name);
+                        // Focus editor after rename
+                        self.focus_editor_frames_remaining = 3;
                     }
                     Err(e) => {
                         self.rename_dialog.error_msg = e;
@@ -814,15 +840,14 @@ impl IrakNotesApp {
     }
 }
 
-// ── text-position utility functions (Part 2) ──────────────────────────────────
+// ── text-position utility functions ───────────────────────────────────────────
 
-/// Convert a **char index** into a (line, col) pair (both 1-based).
+/// Convert a **char index** into a (line, col) pair.
+/// `line` is 1-based, `col` is 0-based (to match tkinter's column convention).
 ///
 /// Mirrors Python:
 ///   position = self.text.index(tk.INSERT)   # "line.column"
 ///   line, column = position.split('.')
-///
-/// `col` is 0-based to match tkinter's column convention.
 pub fn char_index_to_line_col(text: &str, char_idx: usize) -> (usize, usize) {
     let mut line = 1usize;
     let mut col  = 0usize;
@@ -838,69 +863,40 @@ pub fn char_index_to_line_col(text: &str, char_idx: usize) -> (usize, usize) {
     (line, col)
 }
 
+/// Get the char index of the start of a 1-based line.
 fn line_start_char_index(text: &str, line_1_based: usize) -> usize {
     if line_1_based <= 1 {
         return 0;
     }
     let mut current_line = 1usize;
-    let mut idx = 0usize;
-    for ch in text.chars() {
-        if current_line == line_1_based {
-            break;
-        }
-        idx += 1;
+    for (i, ch) in text.chars().enumerate() {
         if ch == '\n' {
             current_line += 1;
+            if current_line == line_1_based {
+                return i + 1;
+            }
         }
     }
-    idx
+    // If the requested line doesn't exist, return end of text
+    text.chars().count()
 }
 
+/// Get the char index of the end of a 1-based line (before the \n).
 fn line_end_char_index(text: &str, line_1_based: usize) -> usize {
     let mut current_line = 1usize;
-    let mut idx = 0usize;
-    for ch in text.chars() {
-        if current_line == line_1_based && ch == '\n' {
-            return idx;
-        }
-        idx += 1;
+    for (i, ch) in text.chars().enumerate() {
         if ch == '\n' {
+            if current_line == line_1_based {
+                return i;
+            }
             current_line += 1;
         }
     }
-    idx
+    // Last line (no trailing \n)
+    text.chars().count()
 }
 
-fn line_first_non_whitespace_char_index(text: &str, line_1_based: usize) -> usize {
-    let start = line_start_char_index(text, line_1_based);
-    let end   = line_end_char_index(text, line_1_based);
-    if end <= start { return start; }
-
-    let mut offset = 0usize;
-    for ch in text.chars().skip(start).take(end - start) {
-        if !ch.is_whitespace() {
-            return start + offset;
-        }
-        offset += 1;
-    }
-    start
-}
-
-fn line_last_non_whitespace_char_index(text: &str, line_1_based: usize) -> usize {
-    let start = line_start_char_index(text, line_1_based);
-    let end   = line_end_char_index(text, line_1_based);
-    if end <= start { return end; }
-
-    let chars: Vec<char> = text.chars().skip(start).take(end - start).collect();
-
-    for idx in (0..chars.len()).rev() {
-        if !chars[idx].is_whitespace() {
-            return start + idx + 1;
-        }
-    }
-    end
-}
-
+/// Get the total number of columns (characters) in a 1-based line.
 fn line_total_cols(text: &str, line_1_based: usize) -> usize {
     let start = line_start_char_index(text, line_1_based);
     let end = line_end_char_index(text, line_1_based);

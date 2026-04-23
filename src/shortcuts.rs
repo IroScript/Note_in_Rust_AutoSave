@@ -52,6 +52,12 @@ pub fn shortcut_data() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)>
                 ("Ctrl+Shift+B",  "Change background color"),
             ],
         ),
+        (
+            "Quick Actions",
+            vec![
+                ("Right-click",   "Copy (with selection) / Paste (without selection)"),
+            ],
+        ),
     ]
 }
 
